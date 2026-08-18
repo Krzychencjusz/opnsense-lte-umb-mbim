@@ -400,7 +400,3 @@ When the primary WAN returned, the default route moved back to the primary inter
         ├── 40-umb-widget-patch.sh
         └── 50-umb.sh
 ```
-
-## License
-
-No license has been selected yet. Add a `LICENSE` file before publishing if you want to define reuse and redistribution terms.
