@@ -1,392 +1,187 @@
 # OPNsense UMB/MBIM LTE WAN support
 
-This repository documents a tested way to use FreeBSD `umb(4)` / MBIM cellular interfaces as WAN interfaces on OPNsense, including automatic dynamic gateway synchronization and optional dashboard labelling.
+This repository documents a custom integration for using FreeBSD `umb(4)` / MBIM cellular interfaces as WAN interfaces on OPNsense. It synchronizes the modem's current IPv4 peer with the configured gateway and maintains the interface gateway assignment required for automatic outbound NAT.
 
-The setup was developed and tested with a Sierra Wireless MC7455, but the watcher is intentionally written for generic FreeBSD `umbX` interfaces.
+The integration was developed with a Sierra Wireless MC7455. Interface and gateway discovery uses generic `umbX` device names; it is not hard-coded to `opt3` or `WAN_LTE_PPP`.
 
 ## What this solves
 
-FreeBSD can bring an MBIM modem up as a point-to-point `umbX` interface and obtain an address such as:
+A connected MBIM modem exposes a point-to-point interface, for example:
 
 ```text
-inet 10.161.237.225 --> 10.161.237.226
+inet 10.xxx.xxx.225 --> 10.xxx.xxx.226
 ```
 
-The right-hand address is the current MBIM peer and must be used as the IPv4 gateway.
+The right-hand address is the current peer and is used as the IPv4 gateway. It can change after a reconnect.
 
-OPNsense sees the interface and its endpoint, but does not automatically use the dynamic `umbX` endpoint as the configured gateway. The peer may also change after a reboot or reconnect.
+Updating the gateway address alone is insufficient for automatic outbound NAT in the tested OPNsense configuration. The gateway must also be assigned to the corresponding OPNsense interface. A working default route does not by itself confirm that NAT exists for LAN clients.
 
-`umb-watch.sh` closes that gap.
+For every active `umbX` interface, the updated watcher:
 
-For every active `umbX` interface it:
+1. Reads the current IPv4 peer.
+2. Finds its enabled OPNsense interface assignment.
+3. Finds the single enabled IPv4 gateway for that interface.
+4. Synchronizes the gateway address and the interface's gateway assignment.
+5. Saves the configuration only when either value changes.
+6. Reapplies routing and firewall rules after changes, retrying failed reloads.
 
-1. detects the current MBIM peer;
-2. finds which internal OPNsense interface (`wan`, `opt1`, `opt4`, etc.) is assigned to that device;
-3. finds the single enabled IPv4 gateway assigned to that OPNsense interface;
-4. updates that gateway when the MBIM peer changes;
-5. asks OPNsense to rebuild routing.
-
-Nothing is hard-coded to a specific `optX` or gateway name.
-
-## Multiple modems
-
-The watcher supports multiple `umbX` devices in one process.
-
-Example:
-
-```text
-umb0 -> wan  -> LTE_MAIN
-umb1 -> opt4 -> LTE_BACKUP
-umb2 -> opt7 -> MOBILE_3
-```
-
-The mappings are discovered from the live OPNsense configuration.
-
-For safety, a given OPNsense interface must have exactly one enabled IPv4 gateway. If zero or multiple matching gateways are found, the watcher refuses to make an ambiguous change and logs the condition.
-
-## Tested behaviour
-
-The following was verified on the test system:
-
-- `umb(4)` loads at boot;
-- the modem reconnects after reboot and cold boot;
-- the MBIM peer can change between sessions;
-- the watcher detects the new peer and updates the correct OPNsense gateway;
-- the watcher tolerates a long period with no LTE address;
-- the watcher does not reset the modem while waiting for connectivity;
-- primary WAN -> LTE failover works;
-- LTE -> primary WAN failback works;
-- the solution does not depend on a gateway group being present;
-- the watcher does not depend on specific OPNsense internal interface names;
-- mapping logic was also tested in-memory with two simulated `umb` assignments.
+The configuration is checked every 10 seconds even when the peer is unchanged. This allows a missing gateway assignment to be restored after an interface settings save. Restoration may take one polling interval plus the reload time; it is not instantaneous. The watcher also reapplies routing and firewall rules once after startup when it finds a valid UMB configuration.
 
 ## Why MBIM instead of PPP
 
-PPP was tested first. The MC7455 registered successfully and PPP could negotiate LCP/PAP/IPCP and obtain an IPv4 address, but data traffic showed PPP FCS errors and was unusable.
+On the original MC7455 installation, PPP could establish a session but data traffic suffered from FCS errors. Native `umb(4)` / MBIM provided working IP traffic.
 
-Using the native FreeBSD `umb(4)` driver and MBIM immediately produced working IP traffic.
+The tested modem exposed USB functions `diag,nmea,modem,mbim`, with USB ID `1199:9071`.
 
-The modem used in testing exposed:
+## 1. Load the driver
 
-```text
-diag,nmea,modem,mbim
-```
-
-with USB ID:
-
-```text
-1199:9071
-```
-
-## 1. Load the UMB driver at boot
-
-Create or edit:
-
-```text
-/boot/loader.conf.local
-```
-
-and add:
+Add this to `/boot/loader.conf.local`:
 
 ```text
 umb_load="YES"
 ```
 
-After reboot, verify:
+After reboot, check:
 
 ```sh
 ifconfig umb0
 ```
 
-or, for all UMB devices:
+## 2. Configure the APN
 
-```sh
-ifconfig -l
-```
-
-## 2. Configure the modem APN
-
-Example:
+Use your operator's APN. For example:
 
 ```sh
 umbctl umb0 apn internet
-```
-
-Verify:
-
-```sh
 umbctl umb0
 ```
 
-In the tested setup the APN persisted across interface down/up and reboot, so the final startup hook deliberately does not call `umbctl` on every boot.
+Verify that the modem reconnects with the correct APN after reboot. APN persistence and any local startup configuration should be checked on the actual installation.
 
-## 3. Assign the interface in OPNsense
+## 3. Assign the interface
 
-Assign the `umbX` device to an OPNsense interface.
+Assign the `umbX` device in OPNsense and enable the interface. Set **IPv4 Configuration Type** to **None**. The modem supplies its address and point-to-point peer directly; do not enable DHCP on this interface.
 
-For IPv4 Configuration Type use:
+## 4. Create the gateway
 
-```text
-None
-```
+Create exactly one enabled IPv4 gateway for each assigned UMB interface. Initially use the modem's current peer as its gateway address. The watcher will update it when the peer changes.
 
-Do not use DHCP on the UMB interface. MBIM/`umb(4)` assigns the address and point-to-point endpoint directly.
+The gateway name is arbitrary. Configure monitoring and failover policy according to your network; the watcher does not create gateway groups or change their tiers.
 
-## 4. Create an IPv4 gateway
+## 5. Install the watcher and PHP helper
 
-Create one enabled IPv4 gateway for each assigned `umbX` interface.
-
-The gateway address may initially be a placeholder/current peer; the watcher will synchronize it automatically when the modem obtains a peer.
-
-A monitor address such as:
-
-```text
-1.1.1.1
-```
-
-worked in testing.
-
-The gateway name is arbitrary. It does not have to be `WAN_LTE_PPP` or any other fixed name.
-
-## 5. Install the watcher
-
-Copy:
-
-```text
-scripts/umb-watch.sh
-```
-
-to:
-
-```text
-/usr/local/sbin/umb-watch.sh
-```
-
-and make it executable:
+Both files are required. Run these commands as root from the repository directory:
 
 ```sh
-chmod +x /usr/local/sbin/umb-watch.sh
+cp scripts/umb-gateway-sync.php /usr/local/sbin/umb-gateway-sync.php
+chmod 0644 /usr/local/sbin/umb-gateway-sync.php
+cp scripts/umb-watch.sh /usr/local/sbin/umb-watch.sh
+chmod 0755 /usr/local/sbin/umb-watch.sh
 ```
+
+Validate the files before starting them:
+
+```sh
+php -l /usr/local/sbin/umb-gateway-sync.php
+sh -n /usr/local/sbin/umb-watch.sh
+```
+
+The PHP helper is executed through PHP, so it does not need executable permissions. Keep both files owned by root and not writable by unprivileged users.
+
+For an existing installation, back up the installed scripts and OPNsense configuration before replacing them. After replacing both files, reboot during your maintenance window to start the new watcher through the existing startup hook. Replacing files does not restart an already running watcher.
 
 ## 6. Install the startup hook
 
-Copy:
-
-```text
-scripts/rc.syshook.d/50-umb.sh
+```sh
+cp scripts/rc.syshook.d/50-umb.sh /usr/local/etc/rc.syshook.d/start/50-umb.sh
+chmod 0755 /usr/local/etc/rc.syshook.d/start/50-umb.sh
 ```
 
-to:
+The existing hook brings UMB interfaces up and launches the watcher using `daemon(8)`. No change to the hook is required for the NAT fix. Retain any working local APN handling in your installed hook.
 
-```text
-/usr/local/etc/rc.syshook.d/start/50-umb.sh
-```
+## 7. Optional dashboard label
 
-and make it executable:
+The optional widget patch replaces the displayed UMB media label `<unknown type>` with `LTE / MBIM`. It does not configure routing or NAT.
 
 ```sh
-chmod +x /usr/local/etc/rc.syshook.d/start/50-umb.sh
+cp scripts/umb-widget-patch.sh /usr/local/sbin/umb-widget-patch.sh
+chmod 0755 /usr/local/sbin/umb-widget-patch.sh
+cp scripts/rc.syshook.d/40-umb-widget-patch.sh /usr/local/etc/rc.syshook.d/start/40-umb-widget-patch.sh
+chmod 0755 /usr/local/etc/rc.syshook.d/start/40-umb-widget-patch.sh
 ```
 
-The hook detects every `umbX`, brings it administratively up and launches one detached watcher process through FreeBSD `daemon(8)`.
+The patch checks for its marker before modifying the widget. It refuses to patch when the expected insertion point is absent. Core updates can replace the widget file, so check this optional component after upgrades.
 
-It does not wait for LTE registration. OPNsense can finish boot while the modem establishes service in the background.
+## Behaviour and safeguards
 
-## 7. Optional: show `LTE / MBIM` instead of `<unknown type>`
+- Supports discovery of multiple UMB interfaces in one watcher process.
+- Does not reset the modem while waiting for an address.
+- Defers synchronization when an interface has no IPv4 peer.
+- Refuses ambiguous interface or gateway mappings.
+- Refuses to overwrite a conflicting explicit interface gateway assignment.
+- Does not change APNs, interface addressing mode, gateway priorities, NAT mode, or gateway groups.
+- Uses OPNsense's automatic outbound NAT generation rather than adding manual NAT rules.
+- Requires automatic outbound NAT to be enabled through **Automatic** or **Hybrid** mode.
 
-FreeBSD reports the UMB media type as:
-
-```text
-<unknown type>
-```
-
-and OPNsense passes that value through to the existing Interfaces dashboard widget.
-
-The optional patch changes only the dashboard presentation for devices whose name starts with `umb`.
-
-Copy:
-
-```text
-scripts/umb-widget-patch.sh
-```
-
-to:
-
-```text
-/usr/local/sbin/umb-widget-patch.sh
-```
-
-and:
-
-```text
-scripts/rc.syshook.d/40-umb-widget-patch.sh
-```
-
-to:
-
-```text
-/usr/local/etc/rc.syshook.d/start/40-umb-widget-patch.sh
-```
-
-Then:
+The helper defaults to a read-only check. Example using the actual current peer:
 
 ```sh
-chmod +x /usr/local/sbin/umb-widget-patch.sh
-chmod +x /usr/local/etc/rc.syshook.d/start/40-umb-widget-patch.sh
+php /usr/local/sbin/umb-gateway-sync.php umb0 10.161.237.226 --check
 ```
 
-The patch adds:
+Only `--apply` requests configuration writes. The watcher supplies this flag. Helper exit codes are:
 
-```js
-if ((intf_data.device ?? "").startsWith("umb")) media = "LTE / MBIM"; // umb-media-patch
-```
+| Code | Meaning |
+| --- | --- |
+| 0 | Read-only check completed, or no changes required |
+| 2 | Invalid input or unsupported configuration structure |
+| 3 | Expected exactly one enabled interface assignment |
+| 4 | Expected exactly one enabled IPv4 gateway |
+| 5 | Missing gateway name or conflicting gateway assignment |
+| 6 | Could not record the pending reload |
+| 7 | Configuration save failed |
+| 10 | Configuration changed and saved |
 
-to the existing OPNsense Interfaces widget.
-
-The patcher is idempotent: if the marker already exists, it exits without modifying the file. If a future OPNsense version changes the expected widget layout, it refuses to patch blindly and logs an error.
-
-## Fail-safe behaviour
-
-`umb-watch.sh` uses defensive exit codes from its PHP configuration lookup:
-
-- `2` — expected OPNsense configuration structure is missing/incompatible;
-- `3` — no OPNsense interface assignment exists for the `umbX` device;
-- `4` — no enabled IPv4 gateway exists for the assigned interface;
-- `5` — more than one enabled IPv4 gateway matches, so the update is ambiguous.
-
-Errors are logged with:
-
-```text
-umb-watch
-```
-
-The watcher also stores per-device state under:
+Messages use the log tag `umb-watch`. Runtime state is stored under:
 
 ```text
 /var/run/umb-watch.umbX.peer
 /var/run/umb-watch.umbX.err
-```
-
-A single lock directory prevents duplicate watcher instances:
-
-```text
+/var/run/umb-watch.reload-pending
 /var/run/umb-watch.lock
 ```
 
-## Failover is optional
+## Verification
 
-The watcher only synchronizes the current MBIM peer with the matching OPNsense IPv4 gateway.
-
-It does not configure gateway groups, policy routing, tiers, load balancing or default-route policy.
-
-Therefore the same mechanism can be used when `umbX` is:
-
-- the only WAN;
-- an additional independent WAN;
-- part of a failover group;
-- part of a load-balancing design;
-- one of several cellular WANs.
-
-Those policies remain under normal OPNsense configuration.
-
-## Useful checks
-
-Show all UMB interfaces:
+Check the interface, watcher, routing, and loaded NAT rules:
 
 ```sh
-ifconfig -l | tr ' ' '\n' | awk '/^umb[0-9]+$/'
-```
-
-Show current point-to-point address:
-
-```sh
-ifconfig umb0 | grep inet
-```
-
-Check the watcher:
-
-```sh
+ifconfig umb0
 ps axww | grep '[u]mb-watch'
-```
-
-Show the state recorded for a modem:
-
-```sh
-cat /var/run/umb-watch.umb0.peer
-```
-
-Show routing:
-
-```sh
 netstat -rn -f inet
+pfctl -sn
 ```
 
-Show how OPNsense currently maps UMB devices to internal interface IDs and gateways:
+With an active LTE connection and automatic NAT enabled, expect `nat on umb0` rules for the internal networks.
 
-```sh
-php -r 'require_once "/usr/local/etc/inc/config.inc"; global $config; foreach ($config["interfaces"] as $id=>$cfg) { $dev=$cfg["if"] ?? ""; if (preg_match("/^umb[0-9]+$/",$dev)) { echo "$dev -> $id\n"; foreach ($config["OPNsense"]["Gateways"]["gateway_item"] as $gw) { if (($gw["interface"] ?? "") === $id && ($gw["ipprotocol"] ?? "") === "inet" && ($gw["disabled"] ?? "0") !== "1") echo "  gateway: ".($gw["name"] ?? "")." = ".($gw["gateway"] ?? "")."\n"; } } }'
-```
+Test Internet access from a LAN client while the primary WAN is disconnected, then test failback and another failover. A successful request originating on the firewall alone does not verify client NAT.
 
-## Upgrade considerations
+Also verify behaviour after reboot and after saving the UMB interface settings. Check that the gateway assignment and NAT rules are present after the watcher has had time to run.
 
-This is a custom integration, not native OPNsense UMB gateway support.
+The NAT fix was tested on OPNsense **26.7.7**: automatic NAT rules appeared after the interface gateway assignment was added, LAN client Internet access over LTE worked, WAN/LTE switching worked, and the rules were present after reboot with the updated watcher installed. This does not establish compatibility with every OPNsense version or modem.
 
-The design avoids hard-coding OPNsense internal interface names and gateway names, and it deliberately refuses unsafe writes if the expected configuration structure changes.
+## Upgrade and backup considerations
 
-Still, after every major OPNsense upgrade verify:
-
-```text
-umb.ko
-umbctl
-umbX interface creation
-umb-watch process
-dynamic peer -> gateway synchronization
-routing
-failover/failback, if used
-dashboard patch, if used
-```
-
-The optional dashboard patch modifies an OPNsense core JavaScript file. An OPNsense core update may overwrite that file. `40-umb-widget-patch.sh` automatically reapplies the patch on boot if the expected insertion point still exists.
-
-The watcher currently uses OPNsense's PHP configuration structure and:
+This is a custom integration using OPNsense's PHP configuration structure and these commands:
 
 ```sh
 configctl interface routes configure
+configctl filter reload
 ```
 
-A future major OPNsense redesign could require an update to those integration points.
+After upgrades, verify driver loading, modem addressing, watcher startup, gateway synchronization, automatic NAT, and client traffic. Future changes to OPNsense may require updates to the integration.
 
-## Notes from the tested MC7455 setup
-
-Example modem status:
-
-```text
-Sierra Wireless MC7455
-Firmware: SWI9X30C_02.20.03.00
-USB configuration: diag,nmea,modem,mbim
-```
-
-Example working UMB session:
-
-```text
-inet 10.161.237.225 --> 10.161.237.226
-```
-
-Example routing with primary WAN online:
-
-```text
-default        192.168.26.1       UGS   igb0
-1.1.1.1        10.161.237.226     UGHS  umb0
-```
-
-Example routing after primary WAN failure:
-
-```text
-default        10.161.237.226     UGS   umb0
-1.1.1.1        10.161.237.226     UGHS  umb0
-```
-
-When the primary WAN returned, the default route moved back to the primary interface.
+Back up the scripts and startup hooks separately: an OPNsense XML configuration export does not include these custom files.
 
 ## Repository layout
 
@@ -395,6 +190,7 @@ When the primary WAN returned, the default route moved back to the primary inter
 ├── README.md
 └── scripts
     ├── umb-watch.sh
+    ├── umb-gateway-sync.php
     ├── umb-widget-patch.sh
     └── rc.syshook.d
         ├── 40-umb-widget-patch.sh
