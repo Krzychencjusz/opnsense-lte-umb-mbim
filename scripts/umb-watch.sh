@@ -1,47 +1,58 @@
 #!/bin/sh
+# UMB watcher: synchronize peer AND interface gateway link; preserve automatic NAT.
 LOCKDIR=/var/run/umb-watch.lock
+PENDING=/var/run/umb-watch.reload-pending
 mkdir "$LOCKDIR" 2>/dev/null || exit 0
-cleanup() { rmdir "$LOCKDIR" 2>/dev/null; exit 0; }
-trap cleanup HUP INT TERM
 trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+trap 'exit 0' HUP INT TERM
+FIRST=1
+RELOAD_ERROR=0
 while :; do
-    CHANGED=0
+    VALID=0
     for DEV in $(/sbin/ifconfig -l | /usr/bin/tr ' ' '\n' | /usr/bin/awk '/^umb[0-9]+$/ {print}'); do
-        PEER=$(/sbin/ifconfig "$DEV" 2>/dev/null | /usr/bin/awk '/inet / {print $4; exit}')
+        PEER=$(/sbin/ifconfig "$DEV" 2>/dev/null | /usr/bin/awk '$1 == "inet" && $3 == "-->" {print $4; exit}')
         STATE="/var/run/umb-watch.${DEV}.peer"
         ERRSTATE="/var/run/umb-watch.${DEV}.err"
         if [ -z "$PEER" ]; then
             /bin/rm -f "$STATE" "$ERRSTATE"
             continue
         fi
-        OLD=$(/bin/cat "$STATE" 2>/dev/null)
-        if [ "$PEER" = "$OLD" ]; then
-            continue
-        fi
-        /usr/local/bin/php -r 'require_once "/usr/local/etc/inc/config.inc"; require_once "/usr/local/etc/inc/util.inc"; global $config; if (isset($config["interfaces"]) === false || is_array($config["interfaces"]) === false || isset($config["OPNsense"]["Gateways"]["gateway_item"]) === false || is_array($config["OPNsense"]["Gateways"]["gateway_item"]) === false) exit(2); $dev=$argv[1]; $peer=$argv[2]; $ifid=null; foreach ($config["interfaces"] as $id=>$cfg) { if (($cfg["if"] ?? "") === $dev) { $ifid=$id; break; } } if ($ifid === null) exit(3); $matches=[]; foreach ($config["OPNsense"]["Gateways"]["gateway_item"] as $idx=>$gw) { if (($gw["interface"] ?? "") === $ifid && ($gw["ipprotocol"] ?? "") === "inet" && ($gw["disabled"] ?? "0") !== "1") $matches[]=$idx; } if (count($matches) === 0) exit(4); if (count($matches) > 1) exit(5); $idx=$matches[0]; if (($config["OPNsense"]["Gateways"]["gateway_item"][$idx]["gateway"] ?? "") !== $peer) { $config["OPNsense"]["Gateways"]["gateway_item"][$idx]["gateway"]=$peer; write_config("Update ".$dev." MBIM gateway"); } exit(0);' "$DEV" "$PEER"
+        # Always inspect the current configuration, even when PEER has not changed.
+        RESULT=$(/usr/local/bin/php /usr/local/sbin/umb-gateway-sync.php "$DEV" "$PEER" --apply 2>&1)
         RC=$?
-        if [ "$RC" = "0" ]; then
-            echo "$PEER" > "$STATE"
-            /bin/rm -f "$ERRSTATE"
-            CHANGED=1
+        case "$RC" in
+            0|10)
+                VALID=1
+                printf '%s\n' "$PEER" > "$STATE"
+                /bin/rm -f "$ERRSTATE"
+                if [ "$RC" = 10 ]; then
+                    /usr/bin/logger -t umb-watch "Gateway configuration synchronized: $RESULT"
+                fi
+                ;;
+            *)
+                ERRKEY="${PEER}:${RC}"
+                OLDERR=$(/bin/cat "$ERRSTATE" 2>/dev/null)
+                if [ "$ERRKEY" != "$OLDERR" ]; then
+                    /usr/bin/logger -t umb-watch "Gateway synchronization failed: $RESULT"
+                    printf '%s\n' "$ERRKEY" > "$ERRSTATE"
+                fi
+                ;;
+        esac
+    done
+    # A fresh process also reapplies once, recovering an interrupted previous run.
+    if [ "$VALID" = 1 ] && { [ "$FIRST" = 1 ] || [ -f "$PENDING" ]; }; then
+        if /usr/local/sbin/configctl interface routes configure >/dev/null 2>&1 &&
+           /usr/local/sbin/configctl filter reload >/dev/null 2>&1; then
+            /bin/rm -f "$PENDING"
+            FIRST=0
+            RELOAD_ERROR=0
+            /usr/bin/logger -t umb-watch "Routes and firewall rules reapplied"
         else
-            ERRKEY="${PEER}:${RC}"
-            OLDERR=$(/bin/cat "$ERRSTATE" 2>/dev/null)
-            if [ "$ERRKEY" != "$OLDERR" ]; then
-                case "$RC" in
-                    2) MSG="OPNsense configuration structure incompatible" ;;
-                    3) MSG="no OPNsense interface assignment found for $DEV" ;;
-                    4) MSG="no IPv4 gateway found for $DEV" ;;
-                    5) MSG="multiple IPv4 gateways found for $DEV - refusing ambiguous update" ;;
-                    *) MSG="gateway update failed for $DEV with PHP exit code $RC" ;;
-                esac
-                /usr/bin/logger -t umb-watch "$MSG"
-                echo "$ERRKEY" > "$ERRSTATE"
+            if [ "$RELOAD_ERROR" = 0 ]; then
+                /usr/bin/logger -t umb-watch "Routes/firewall reload failed; retrying on subsequent checks"
+                RELOAD_ERROR=1
             fi
         fi
-    done
-    if [ "$CHANGED" = "1" ]; then
-        /usr/local/sbin/configctl interface routes configure >/dev/null 2>&1
     fi
     sleep 10
 done
